@@ -82,15 +82,33 @@ fn VkCompositeAlphaFlagBitsKHR choose_composite_alpha(VkCompositeAlphaFlagsKHR s
 	return 0;
 }
 
+fn Uint2 resolve_surface_extent(Device* device, VkSurfaceCapabilitiesKHR* caps) @private
+{
+	if (caps.currentExtent.width != uint::max && caps.currentExtent.height != uint::max)
+	{
+		return { caps.currentExtent.width, caps.currentExtent.height };
+	}
+	if (device.surface_provider.get_extent)
+	{
+		Uint2 size = device.surface_provider.get_extent(device.surface_provider.user_data);
+		if (size.x == 0 || size.y == 0) return {};
+		return {
+			min(max(size.x, caps.minImageExtent.width), caps.maxImageExtent.width),
+			min(max(size.y, caps.minImageExtent.height), caps.maxImageExtent.height),
+		};
+	}
+	return { caps.minImageExtent.width, caps.minImageExtent.height };
+}
+
 fn bool swapchain_surface_configuration_changed(Swapchain* swapchain) @private
 {
 	Device* device = swapchain.device;
 	VkSurfaceCapabilitiesKHR capabilities;
 	@require_ok(check_vk(device.vk.vkGetPhysicalDeviceSurfaceCapabilitiesKHR(device.physical_device, device.surface, &capabilities),
 		"vkGetPhysicalDeviceSurfaceCapabilitiesKHR"), "Display surface query");
-	VkExtent2D extent = capabilities.currentExtent;
-	return extent.width == uint::max || extent.height == uint::max || extent.width != swapchain.width || extent.height != swapchain.height
-		|| capabilities.currentTransform != swapchain.transform || choose_composite_alpha(capabilities.supportedCompositeAlpha) != swapchain.composite_alpha;
+	Uint2 target = resolve_surface_extent(device, &capabilities);
+	bool size_changed = target.x != swapchain.width || target.y != swapchain.height;
+	return size_changed || capabilities.currentTransform != swapchain.transform || choose_composite_alpha(capabilities.supportedCompositeAlpha) != swapchain.composite_alpha;
 }
 
 <*
@@ -113,15 +131,24 @@ fn void? recreate_swapchain(Swapchain* swapchain) @private
 	check_vk(vk.vkGetPhysicalDeviceSurfaceCapabilities2KHR(device.physical_device, &surface_info, &capabilities_info), "vkGetPhysicalDeviceSurfaceCapabilities2KHR")!;
 	VkSurfaceCapabilitiesKHR* capabilities = &capabilities_info.surfaceCapabilities;
 
-	VkExtent2D extent = capabilities.currentExtent;
-	if (extent.width == uint::max) return UNSUPPORTED~;
-	if ((capabilities.supportedUsageFlags & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT) == 0) return UNSUPPORTED~;
+	Uint2 resolved = resolve_surface_extent(device, capabilities);
+	VkExtent2D extent = { resolved.x, resolved.y };
+	if ((capabilities.supportedUsageFlags & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT) == 0)
+	{
+		report("Surface does not support color attachment usage.");
+		return UNSUPPORTED~;
+	}
 
-	VkSurfaceFormatKHR[MAX_SURFACE_FORMATS] formats;
 	uint surface_format_count;
 	check_vk(vk.vkGetPhysicalDeviceSurfaceFormatsKHR(device.physical_device, device.surface, &surface_format_count, null), "vkGetPhysicalDeviceSurfaceFormatsKHR")!;
-	if (surface_format_count == 0 || surface_format_count > MAX_SURFACE_FORMATS) return UNSUPPORTED~;
-	check_vk(vk.vkGetPhysicalDeviceSurfaceFormatsKHR(device.physical_device, device.surface, &surface_format_count, &formats[0]), "vkGetPhysicalDeviceSurfaceFormatsKHR")!;
+	if (surface_format_count == 0)
+	{
+		report("Surface returned zero supported formats.");
+		return UNSUPPORTED~;
+	}
+	VkSurfaceFormatKHR[] formats = mem::new_array(VkSurfaceFormatKHR, surface_format_count);
+	defer mem::free(formats.ptr);
+	check_vk(vk.vkGetPhysicalDeviceSurfaceFormatsKHR(device.physical_device, device.surface, &surface_format_count, formats.ptr), "vkGetPhysicalDeviceSurfaceFormatsKHR")!;
 
 	VkFormat requested_format = vk_format(swapchain.format);
 	bool format_supported;
@@ -133,7 +160,11 @@ fn void? recreate_swapchain(Swapchain* swapchain) @private
 			break;
 		}
 	}
-	if (!format_supported) return UNSUPPORTED~;
+	if (!format_supported)
+	{
+		report(string::tformat("Requested swapchain format %d with colorspace %d is unsupported by surface.", (int)requested_format, (int)swapchain.color_space));
+		return UNSUPPORTED~;
+	}
 
 	if (extent.width == 0 || extent.height == 0)
 	{
@@ -256,15 +287,10 @@ fn Uint2 Device.drawable_extent(&self)
 	if (!self.swapchain) return {};
 	VkSurfaceCapabilitiesKHR capabilities;
 	if (catch check_vk(self.vk.vkGetPhysicalDeviceSurfaceCapabilitiesKHR(self.physical_device, self.surface, &capabilities), "vkGetPhysicalDeviceSurfaceCapabilitiesKHR")) return {};
-	VkExtent2D extent = capabilities.currentExtent;
-	if (extent.width == uint::max || extent.height == uint::max)
-	{
-		report("The display surface does not provide a fixed drawable extent.");
-		return {};
-	}
+	Uint2 extent = resolve_surface_extent(self, &capabilities);
 	Swapchain* swapchain = self.swapchain;
-	if (swapchain.handle && (swapchain.width != extent.width || swapchain.height != extent.height)) swapchain.recreate_required = true;
-	return { extent.width, extent.height };
+	if (swapchain.handle && (swapchain.width != extent.x || swapchain.height != extent.y)) swapchain.recreate_required = true;
+	return extent;
 }
 
 <*
@@ -280,6 +306,10 @@ fn SwapchainFrame CommandBuffer.acquire(&self)
 	device.poll_presentation_retirement();
 
 	Swapchain* swapchain = device.swapchain;
+	if (swapchain.handle && swapchain_surface_configuration_changed(swapchain))
+	{
+		swapchain.recreate_required = true;
+	}
 	PresentContext* present_context;
 	for (;;)
 	{

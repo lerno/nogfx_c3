@@ -26,7 +26,6 @@ const uint MAX_QUEUE_FAMILIES = 64;
 const uint QUEUE_TYPE_COUNT = 3;   // General, compute only, copy only.
 const uint MAX_COLOR_ATTACHMENTS = 8;
 const uint MAX_SWAPCHAIN_IMAGES = 8;
-const uint MAX_SURFACE_FORMATS = 64;
 const uint GPU_ALLOCATION_ALIGNMENT = 16;
 const uint FORMAT_COUNT = Format::values.len;
 const VkPresentModeKHR SWAPCHAIN_PRESENT_MODE = VK_PRESENT_MODE_FIFO_KHR;
@@ -564,6 +563,8 @@ struct Device
 	Swapchain* acquired_swapchain;
 	uint present_context_count;
 	uint next_present_context;
+	bool presentation;
+	SurfaceProvider surface_provider;
 }
 
 // ---- Device memory --------------------------------------------------------------------------------------------------------------

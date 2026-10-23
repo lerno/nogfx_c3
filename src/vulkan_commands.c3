@@ -561,7 +561,7 @@ fn VkBufferImageCopy2 buffer_texture_copy_region(VkDeviceMemoryImageCopyKHR* reg
 fn void CommandBuffer.copy_memory_to_texture(&self, GpuRange source, Texture* destination, TextureCopyDesc copy = {})
 {
 	VkDeviceMemoryImageCopyKHR region = texture_copy_region(destination, copy, source);
-	if (self.device.buffer_map)
+	if (self.device.buffer_map || !self.vk.vkCmdCopyMemoryToImageKHR)
 	{
 		ulong offset;
 		VkBuffer buffer = self.resolve(source, &offset);
@@ -577,19 +577,24 @@ fn void CommandBuffer.copy_memory_to_texture(&self, GpuRange source, Texture* de
 		self.vk.vkCmdCopyBufferToImage2(self.command_buffer, &buffer_info);
 		return;
 	}
-	VkCopyDeviceMemoryImageInfoKHR info = {
-		.sType = VK_STRUCTURE_TYPE_COPY_DEVICE_MEMORY_IMAGE_INFO_KHR,
-		.image = destination.image,
+	ulong offset;
+	VkBuffer buffer = self.resolve(source, &offset);
+	VkBufferImageCopy2 buffer_region = buffer_texture_copy_region(&region, offset);
+	VkCopyBufferToImageInfo2 buffer_info = {
+		.sType = VK_STRUCTURE_TYPE_COPY_BUFFER_TO_IMAGE_INFO_2,
+		.srcBuffer = buffer,
+		.dstImage = destination.image,
+		.dstImageLayout = VK_IMAGE_LAYOUT_GENERAL,
 		.regionCount = 1,
-		.pRegions = &region,
+		.pRegions = &buffer_region,
 	};
-	self.vk.vkCmdCopyMemoryToImageKHR(self.command_buffer, &info);
+	self.vk.vkCmdCopyBufferToImage2(self.command_buffer, &buffer_info);
 }
 
 fn void CommandBuffer.copy_texture_to_memory(&self, Texture* source, GpuRange destination, TextureCopyDesc copy = {})
 {
 	VkDeviceMemoryImageCopyKHR region = texture_copy_region(source, copy, destination);
-	if (self.device.buffer_map)
+	if (self.device.buffer_map || !self.vk.vkCmdCopyImageToMemoryKHR)
 	{
 		ulong offset;
 		VkBuffer buffer = self.resolve(destination, &offset);
@@ -605,13 +610,18 @@ fn void CommandBuffer.copy_texture_to_memory(&self, Texture* source, GpuRange de
 		self.vk.vkCmdCopyImageToBuffer2(self.command_buffer, &buffer_info);
 		return;
 	}
-	VkCopyDeviceMemoryImageInfoKHR info = {
-		.sType = VK_STRUCTURE_TYPE_COPY_DEVICE_MEMORY_IMAGE_INFO_KHR,
-		.image = source.image,
+	ulong offset;
+	VkBuffer buffer = self.resolve(destination, &offset);
+	VkBufferImageCopy2 buffer_region = buffer_texture_copy_region(&region, offset);
+	VkCopyImageToBufferInfo2 buffer_info = {
+		.sType = VK_STRUCTURE_TYPE_COPY_IMAGE_TO_BUFFER_INFO_2,
+		.srcImage = source.image,
+		.srcImageLayout = VK_IMAGE_LAYOUT_GENERAL,
+		.dstBuffer = buffer,
 		.regionCount = 1,
-		.pRegions = &region,
+		.pRegions = &buffer_region,
 	};
-	self.vk.vkCmdCopyImageToMemoryKHR(self.command_buffer, &info);
+	self.vk.vkCmdCopyImageToBuffer2(self.command_buffer, &buffer_info);
 }
 
 <*

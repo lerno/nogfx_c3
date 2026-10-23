@@ -317,9 +317,21 @@ struct DeviceCaps
 
 enum ColorSpace : uint { SRGB, EXTENDED_SRGB_LINEAR }
 
+alias SurfaceCreatorFn = fn ulong?(void* instance, void* user_data);
+alias SurfaceExtentFn = fn Uint2(void* user_data);
+
+struct SurfaceProvider
+{
+	ZString[] required_extensions;
+	SurfaceCreatorFn create_surface;
+	SurfaceExtentFn get_extent;
+	void* user_data;
+}
+
 struct DeviceDesc
 {
-	void* window;                       // A CAMetalLayer* (Metal), or an HWND (Vulkan, Windows only). Null creates a headless device. It must outlive the device.
+	void* window;                       // A CAMetalLayer* (Metal) or an HWND (Vulkan Win32). Null creates a headless device.
+	SurfaceProvider surface_provider;   // Vulkan surface provider for platforms without a native HWND (Linux/BSD).
 	Format swapchain_format;            // Zero is BGRA8_UNORM. Metal: BGRA8_UNORM or BGRA8_SRGB. Vulkan: any format the surface offers.
 	ColorSpace swapchain_color_space;
 	uint desired_swapchain_image_count; // Zero is 2. Metal clamps to 2..3 drawables; Vulkan takes 1..8 presentation contexts.

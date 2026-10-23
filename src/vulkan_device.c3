@@ -407,9 +407,6 @@ fn Device*? create_device(DeviceDesc desc = {})
 	desc.desired_swapchain_image_count = desc.desired_swapchain_image_count ?: 2;
 	if (desc.swapchain_format == UNDEFINED) desc.swapchain_format = BGRA8_UNORM;
 	assert(desc.desired_swapchain_image_count <= MAX_SWAPCHAIN_IMAGES, "swapchain image count must fit the presentation context array");
-	$if !env::WIN32:
-		if (desc.window) return fail(UNSUPPORTED, "Presentation is only supported on Windows: pass a headless device description.")~;
-	$endif
 	Device* device = mem::new(Device);
 	defer catch device.destroy();
 	device.init(&desc)!;
@@ -430,8 +427,10 @@ fn void? Device.init(&self, DeviceDesc* desc)
 	self.texture_heap_alignment = 16;
 	self.texture_memory_type = VK_MAX_MEMORY_TYPES;
 	self.heap_properties.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_HEAP_PROPERTIES_EXT;
+	self.surface_provider = desc.surface_provider;
+	self.presentation = desc.window != null || desc.surface_provider.create_surface != null;
 	self.timestamp_query_count = desc.timestamp_query_count;
-	self.present_context_count = desc.window ? desc.desired_swapchain_image_count : 0;
+	self.present_context_count = self.presentation ? desc.desired_swapchain_image_count : 0;
 
 	SurfaceMaintenance maintenance = self.create_instance(desc)!;
 	Candidate selected = self.select_physical_device(maintenance, desc)!;
@@ -439,13 +438,13 @@ fn void? Device.init(&self, DeviceDesc* desc)
 	if (!self.supports_gpu_heap_memory() || !self.select_texture_memory_type()) return fail(UNSUPPORTED)~;
 	self.check_entry_points(selected.address_commands)!;
 	self.fill_caps(&selected);
-	if (desc.window) self.create_presentation(desc)!;
+	if (self.presentation) self.create_presentation(desc)!;
 }
 
 // Opens the loader and creates the instance, the debug messenger when validation is on, and the surface of the window.
 fn SurfaceMaintenance? Device.create_instance(&self, DeviceDesc* desc)
 {
-	bool presentation = desc.window != null;
+	bool presentation = desc.window != null || desc.surface_provider.create_surface != null;
 	os::DylibHandle? loader = open_loader();
 	if (catch loader) return fail(UNSUPPORTED, "The Vulkan loader was not found: install a Vulkan driver.")~;
 	self.loader = loader;
@@ -455,11 +454,11 @@ fn SurfaceMaintenance? Device.create_instance(&self, DeviceDesc* desc)
 	vk.load_global();
 	if (!vk.vkEnumerateInstanceVersion || !vk.vkEnumerateInstanceExtensionProperties || !vk.vkCreateInstance)
 	{
-		return fail(UNSUPPORTED, "Vulkan 1.4 or newer is required. Update the graphics driver.")~;
+		return fail(UNSUPPORTED, "Vulkan 1.1 or newer loader is required.")~;
 	}
-	uint loader_version = VK_API_VERSION_1_0;
+	uint loader_version;
 	check_vk(vk.vkEnumerateInstanceVersion(&loader_version), "vkEnumerateInstanceVersion")!;
-	if (loader_version < VK_API_VERSION_1_4) return fail(UNSUPPORTED, "Vulkan 1.4 or newer is required. Update the graphics driver.")~;
+	if (loader_version < vk_make_api_version(0, 1, 1, 0)) return fail(UNSUPPORTED, "Vulkan 1.1 or newer loader is required.")~;
 
 	VkExtensionProperties[] instance_extension_storage = mem::new_array(VkExtensionProperties, MAX_INSTANCE_EXTENSIONS)[:MAX_INSTANCE_EXTENSIONS];
 	defer mem::free(instance_extension_storage.ptr);
@@ -470,31 +469,36 @@ fn SurfaceMaintenance? Device.create_instance(&self, DeviceDesc* desc)
 	VkExtensionProperties[] instance_extensions = instance_extension_storage[:instance_extension_count];
 
 	SurfaceMaintenance maintenance;
-	$if env::WIN32:
-		self.swapchain_color_space_enabled = presentation && has_extension(instance_extensions, VK_EXT_SWAPCHAIN_COLOR_SPACE_EXTENSION_NAME);
-		maintenance.khr = presentation && has_extension(instance_extensions, VK_KHR_SURFACE_MAINTENANCE_1_EXTENSION_NAME);
-		maintenance.ext = presentation && has_extension(instance_extensions, VK_EXT_SURFACE_MAINTENANCE_1_EXTENSION_NAME);
-		if (presentation)
+	if (presentation)
+	{
+		self.swapchain_color_space_enabled = has_extension(instance_extensions, VK_EXT_SWAPCHAIN_COLOR_SPACE_EXTENSION_NAME);
+		maintenance.khr = has_extension(instance_extensions, VK_KHR_SURFACE_MAINTENANCE_1_EXTENSION_NAME);
+		maintenance.ext = has_extension(instance_extensions, VK_EXT_SURFACE_MAINTENANCE_1_EXTENSION_NAME);
+		FixedList{ZString, 8} missing;
+		if (!has_extension(instance_extensions, VK_KHR_SURFACE_EXTENSION_NAME)) missing.push(VK_KHR_SURFACE_EXTENSION_NAME);
+		if (!has_extension(instance_extensions, VK_KHR_GET_SURFACE_CAPABILITIES_2_EXTENSION_NAME)) missing.push(VK_KHR_GET_SURFACE_CAPABILITIES_2_EXTENSION_NAME);
+		$if env::WIN32:
+			if (!desc.surface_provider.create_surface && !has_extension(instance_extensions, VK_KHR_WIN32_SURFACE_EXTENSION_NAME)) missing.push(VK_KHR_WIN32_SURFACE_EXTENSION_NAME);
+		$endif
+		if (desc.surface_provider.create_surface)
 		{
-			FixedList{ZString, 5} missing;
-			ZString[3] required_instance_extensions = { VK_KHR_SURFACE_EXTENSION_NAME, VK_KHR_WIN32_SURFACE_EXTENSION_NAME, VK_KHR_GET_SURFACE_CAPABILITIES_2_EXTENSION_NAME };
-			foreach (name : required_instance_extensions)
+			foreach (ext : desc.surface_provider.required_extensions)
 			{
-				if (!has_extension(instance_extensions, name)) missing.push(name);
-			}
-			if (!maintenance.khr && !maintenance.ext) missing.push("VK_KHR_surface_maintenance1 or VK_EXT_surface_maintenance1");
-			if (desc.swapchain_color_space != SRGB && !self.swapchain_color_space_enabled) missing.push(VK_EXT_SWAPCHAIN_COLOR_SPACE_EXTENSION_NAME);
-			if (missing.size)
-			{
-				DString message = dstring::temp("Cannot initialize Vulkan presentation.");
-				append_capability_diagnostic(&message, "Vulkan instance", missing.array_view());
-				return fail(UNSUPPORTED, message.str_view())~;
+				if (!has_extension(instance_extensions, ext)) missing.push(ext);
 			}
 		}
-	$endif
+		if (!maintenance.khr && !maintenance.ext) missing.push("VK_KHR_surface_maintenance1 or VK_EXT_surface_maintenance1");
+		if (desc.swapchain_color_space != SRGB && !self.swapchain_color_space_enabled) missing.push(VK_EXT_SWAPCHAIN_COLOR_SPACE_EXTENSION_NAME);
+		if (missing.size)
+		{
+			DString message = dstring::temp("Cannot initialize Vulkan presentation.");
+			append_capability_diagnostic(&message, "Vulkan instance", missing.array_view());
+			return fail(UNSUPPORTED, message.str_view())~;
+		}
+	}
 
-	FixedList{ZString, 7} instance_names;
-	FixedList{ZString, 1} layer_names;
+	FixedList{ZString, 16} instance_names;
+	FixedList{ZString, 8} layer_names;
 	bool debug_utils_available;
 	$if env::COMPILER_SAFE_MODE:
 		VkLayerProperties[MAX_INSTANCE_LAYERS] layer_storage;
@@ -509,15 +513,21 @@ fn SurfaceMaintenance? Device.create_instance(&self, DeviceDesc* desc)
 			if (((ZString)&layer.layerName[0]).str_view() == "VK_LAYER_KHRONOS_validation") layer_names.push("VK_LAYER_KHRONOS_validation");
 		}
 	$endif
-	$if env::WIN32:
-		if (presentation)
+	if (presentation)
+	{
+		if (self.swapchain_color_space_enabled) instance_names.push(VK_EXT_SWAPCHAIN_COLOR_SPACE_EXTENSION_NAME);
+		instance_names.push(VK_KHR_SURFACE_EXTENSION_NAME);
+		instance_names.push(VK_KHR_GET_SURFACE_CAPABILITIES_2_EXTENSION_NAME);
+		$if env::WIN32:
+			if (!desc.surface_provider.create_surface) instance_names.push(VK_KHR_WIN32_SURFACE_EXTENSION_NAME);
+		$endif
+		if (desc.surface_provider.create_surface)
 		{
-			if (self.swapchain_color_space_enabled) instance_names.push(VK_EXT_SWAPCHAIN_COLOR_SPACE_EXTENSION_NAME);
-			instance_names.push_all({ VK_KHR_SURFACE_EXTENSION_NAME, VK_KHR_WIN32_SURFACE_EXTENSION_NAME, VK_KHR_GET_SURFACE_CAPABILITIES_2_EXTENSION_NAME });
-			if (maintenance.khr) instance_names.push(VK_KHR_SURFACE_MAINTENANCE_1_EXTENSION_NAME);
-			if (maintenance.ext) instance_names.push(VK_EXT_SURFACE_MAINTENANCE_1_EXTENSION_NAME);
+			foreach (ext : desc.surface_provider.required_extensions) instance_names.push(ext);
 		}
-	$endif
+		if (maintenance.khr) instance_names.push(VK_KHR_SURFACE_MAINTENANCE_1_EXTENSION_NAME);
+		if (maintenance.ext) instance_names.push(VK_EXT_SURFACE_MAINTENANCE_1_EXTENSION_NAME);
+	}
 
 	VkApplicationInfo app_info = {
 		.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO,
@@ -551,17 +561,25 @@ fn SurfaceMaintenance? Device.create_instance(&self, DeviceDesc* desc)
 		check_vk(vk.vkCreateDebugUtilsMessengerEXT(self.instance, &debug_info, null, &self.debug_messenger), "vkCreateDebugUtilsMessengerEXT")!;
 	}
 
-	$if env::WIN32:
-		if (presentation)
-		{
+	if (desc.surface_provider.create_surface)
+	{
+		ulong? surf = desc.surface_provider.create_surface((void*)self.instance, desc.surface_provider.user_data);
+		if (catch surf) return fail(DRIVER_ERROR, "surface creation callback failed")~;
+		self.surface = (VkSurfaceKHR)surf;
+	}
+	else if (presentation)
+	{
+		$if env::WIN32:
 			VkWin32SurfaceCreateInfoKHR surface_info = {
 				.sType = VK_STRUCTURE_TYPE_WIN32_SURFACE_CREATE_INFO_KHR,
 				.hinstance = get_module_handle_w(null),
 				.hwnd = desc.window,
 			};
 			check_vk(vk.vkCreateWin32SurfaceKHR(self.instance, &surface_info, null, &self.surface), "vkCreateWin32SurfaceKHR")!;
-		}
-	$endif
+		$else
+			return fail(UNSUPPORTED, "Presentation requires desc.surface_provider on this platform.")~;
+		$endif
+	}
 	return maintenance;
 }
 
@@ -613,7 +631,7 @@ fn Candidate? Device.select_physical_device(&self, SurfaceMaintenance maintenanc
 fn void? Device.create_logical_device(&self, DeviceDesc* desc, Candidate* selected)
 {
 	VkFns* vk = &self.vk;
-	bool presentation = desc.window != null;
+	bool presentation = self.presentation;
 	QueriedFeatures enabled;
 	enabled.init(presentation, selected.unified_image_layouts, selected.address_commands);
 	self.texture_compression_etc2 = selected.texture_compression_etc2;
@@ -658,7 +676,7 @@ fn void? Device.create_logical_device(&self, DeviceDesc* desc, Candidate* select
 		};
 		first_queue += self.queue_type_counts[type];
 	}
-	FixedList{ZString, 7} device_names;
+	FixedList{ZString, 16} device_names;
 	device_names.push_all({ VK_EXT_DESCRIPTOR_HEAP_EXTENSION_NAME, VK_KHR_SHADER_UNTYPED_POINTERS_EXTENSION_NAME, VK_EXT_MESH_SHADER_EXTENSION_NAME });
 	if (selected.address_commands) device_names.push(VK_KHR_DEVICE_ADDRESS_COMMANDS_EXTENSION_NAME);
 	if (selected.unified_image_layouts) device_names.push(VK_KHR_UNIFIED_IMAGE_LAYOUTS_EXTENSION_NAME);
@@ -701,6 +719,7 @@ fn void? Device.check_entry_points(&self, bool address_commands)
 	{
 		return fail(DRIVER_ERROR, "The graphics driver did not provide the required Vulkan command entry points.")~;
 	}
+	self.buffer_map = mem::new(BufferAddressMap);
 	if (address_commands)
 	{
 		if (!vk.vkCmdBindIndexBuffer3KHR || !vk.vkCmdDrawIndirect2KHR || !vk.vkCmdDrawIndexedIndirect2KHR || !vk.vkCmdDispatchIndirect2KHR
@@ -710,9 +729,7 @@ fn void? Device.check_entry_points(&self, bool address_commands)
 		}
 		return;
 	}
-	// Index, indirect and copy commands take buffers, and the heap addresses are resolved to them.
 	if (!vk.vkCmdDrawMeshTasksIndirectEXT) return fail(DRIVER_ERROR, "The graphics driver did not provide vkCmdDrawMeshTasksIndirectEXT.")~;
-	self.buffer_map = mem::new(BufferAddressMap);
 }
 
 fn void Device.fill_caps(&self, Candidate* selected)
